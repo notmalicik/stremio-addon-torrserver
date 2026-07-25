@@ -85,7 +85,6 @@ Once the addon is running, install it in Stremio by visiting:
 http://your_public_ip:7000/manifest.json
 ```
 
-You can also use the **Stremio Addon Search** and enter the URL above.
 
 ## Endpoints
 
