@@ -1,0 +1,15 @@
+{
+  "name": "stremio-jacred-torrserver",
+  "version": "1.0.0",
+  "description": "Stremio addon for streaming via Jackett search and TorrServer with series support",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "stremio-addon-sdk": "^1.2.0"
+  }
+}
