@@ -116,13 +116,27 @@ async function searchJackettByName(title) {
     }
 }
 
-function isFhdOr1080p(torrent) {
-    if (!torrent) return false;
+function getResolutionRank(torrent) {
+    if (!torrent) return 0;
     const qualityVal = (torrent.info && torrent.info.quality) || torrent.quality;
-    if (qualityVal && parseInt(qualityVal) >= 1080) return true;
 
     const title = (torrent.Title || torrent.title || torrent.name || "").toLowerCase();
-    return title.includes("1080p") || title.includes("fhd") || title.includes("fullhd") || title.includes("1080");
+
+    if (qualityVal && parseInt(qualityVal) >= 2160) return 3;
+    if (qualityVal && parseInt(qualityVal) >= 1080) return 2;
+
+    if (title.includes("2160p") || title.includes("4k") || title.includes("uhd") || title.includes("4320p")) return 3;
+    if (title.includes("1080p") || title.includes("fhd") || title.includes("fullhd") || title.includes("1080")) return 2;
+    if (title.includes("720p") || title.includes("hd")) return 1;
+    return 0;
+}
+
+function getResolutionLabel(torrent) {
+    const rank = getResolutionRank(torrent);
+    if (rank >= 3) return "4K";
+    if (rank === 2) return "1080p";
+    if (rank === 1) return "720p";
+    return "SD";
 }
 app.get("/resolve", async (req, res) => {
     const { link, season, episode } = req.query;
@@ -279,10 +293,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
         return link && typeof link === "string" && link.length > 10;
     });
 
-    filteredResults = filteredResults.filter(torrent => isFhdOr1080p(torrent));
-    filteredResults.sort((a, b) => (b.Seeders || b.sid || 0) - (a.Seeders || a.sid || 0));
+    filteredResults.sort((a, b) => {
+        const rankDiff = (getResolutionRank(b) || 0) - (getResolutionRank(a) || 0);
+        if (rankDiff !== 0) return rankDiff;
+        return (b.Seeders || b.sid || 0) - (a.Seeders || a.sid || 0);
+    });
 
-    console.log(`✅ ${filteredResults.length} FHD / 1080p sources remaining.`);
+    console.log(`✅ ${filteredResults.length} sources remaining (sorted: 4K > 1080p > rest).`);
 
     // Calculate exact index (cumulative for multiple seasons)
     const calculatedIndex = (type === "series" && season && episode)
@@ -303,8 +320,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
         const binge = "jacred-" + simpleHash(torrentLink);
         console.log(`📌${id} Stream: ${torrentTitle.substring(0, 50)} | index=${calculatedIndex} | bingeGroup=${binge} | magnet hash=${simpleHash(torrentLink)}`);
+        const resLabel = getResolutionLabel(torrent);
         streams.push({
-            name: `TorrStream\n1080p`,
+            name: `TorrStream\n${resLabel}`,
             title: `💎 ${trackerName}${torrentTitle}\n👤 Seeders: ${seeders}`,
             url: directStreamUrl,
             behaviorHints: {
