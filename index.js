@@ -37,6 +37,57 @@ const TORRSERVER_AUTH_URL = TORRSERVER_USER
 const jackettCache = new Map();
 const CACHE_TTL = 15 * 60 * 1000;
 
+const REQUEST_DELAY = 1100;
+let lastRequestTime = 0;
+const requestQueue = [];
+
+async function rateLimitedRequest(url) {
+    const now = Date.now();
+    const wait = Math.max(0, REQUEST_DELAY - (now - lastRequestTime));
+    if (wait > 0) {
+        await new Promise(r => setTimeout(r, wait));
+    }
+    lastRequestTime = Date.now();
+    return axios.get(url);
+}
+
+async function axiosWithRetry(url, retries = 3, baseDelay = 2000) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await rateLimitedRequest(url);
+        } catch (err) {
+            const status = err.response?.status;
+            if (status === 429 && attempt < retries) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                console.warn(`⏳ Jackett 429 (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms`);
+                await new Promise(r => setTimeout(r, delay));
+                continue;
+            }
+            throw err;
+        }
+    }
+}
+
+async function searchJackettByImdbId(imdbId) {
+    const cacheKey = `imdb_${imdbId.trim()}`;
+    const cached = jackettCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+        return cached.data;
+    }
+
+    const url = `${JACKETT_URL}/api/v1.0/torrents?search=${encodeURIComponent(imdbId)}&apikey=${JACKETT_API_KEY}`;
+    try {
+        const response = await axiosWithRetry(url);
+        const results = ensureArray(response.data);
+        jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
+        return results;
+    } catch (err) {
+        const status = err.response?.status || "N/A";
+        console.error(`❌ Jackett v1 search error (${status}): ${err.message}`);
+        return [];
+    }
+}
+
 function ensureArray(data) {
     if (Array.isArray(data)) return data;
     if (data && Array.isArray(data.Results)) return data.Results;
@@ -54,12 +105,13 @@ async function searchJackettByName(title) {
 
     const url = `${JACKETT_URL}/api/v2.0/indexers/all/results?apikey=${JACKETT_API_KEY}&query=${encodeURIComponent(title)}`;
     try {
-        const response = await axios.get(url);
+        const response = await axiosWithRetry(url);
         const results = ensureArray(response.data);
         jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
         return results;
     } catch (err) {
-        console.error(`❌ Jackett search error:`, err.message);
+        const status = err.response?.status || "N/A";
+        console.error(`❌ Jackett search error (${status}): ${err.message}`);
         return [];
     }
 }
@@ -69,7 +121,7 @@ function isFhdOr1080p(torrent) {
     const qualityVal = (torrent.info && torrent.info.quality) || torrent.quality;
     if (qualityVal && parseInt(qualityVal) >= 1080) return true;
 
-    const title = (torrent.Title || torrent.title || "").toLowerCase();
+    const title = (torrent.Title || torrent.title || torrent.name || "").toLowerCase();
     return title.includes("1080p") || title.includes("fhd") || title.includes("fullhd") || title.includes("1080");
 }
 app.get("/resolve", async (req, res) => {
@@ -117,7 +169,7 @@ app.get("/resolve", async (req, res) => {
 });
 function matchesSeasonAndEpisode(torrent, season, episode) {
     if (!torrent) return false;
-    const title = (torrent.Title || torrent.title || "").toLowerCase();
+    const title = (torrent.Title || torrent.title || torrent.name || "").toLowerCase();
     const s = parseInt(season);
     const e = parseInt(episode);
 
@@ -208,7 +260,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`🔍 Searching Jackett by name: "${titleQuery}"`);
 
     let rawResults = await searchJackettByName(titleQuery);
-    console.log(`📦 Jackett returned ${rawResults.length} raw torrents.`);
+    console.log(`📦 Jackett v2 returned ${rawResults.length} raw torrents.`);
+
+    if (rawResults.length === 0) {
+        console.log(`🔍 No results by name, trying by IMDb ID: "${imdbId}"`);
+        rawResults = await searchJackettByImdbId(imdbId);
+        console.log(`📦 Jackett v1 returned ${rawResults.length} raw torrents.`);
+    }
 
     let filteredResults = ensureArray(rawResults).filter(torrent => torrent && (torrent.Title || torrent.title));
 
@@ -234,7 +292,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     for (const torrent of filteredResults) {
         const torrentLink = torrent.MagnetUri || torrent.magnet || torrent.Link || torrent.Guid;
-        const torrentTitle = torrent.Title || torrent.title || "Unknown";
+        const torrentTitle = torrent.Title || torrent.title || torrent.name || "Unknown";
         const seeders = torrent.Seeders || torrent.sid || 0;
         const trackerName = (torrent.Tracker || torrent.tracker) ? `[${torrent.Tracker || torrent.tracker}] ` : "";
 
