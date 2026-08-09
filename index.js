@@ -313,13 +313,21 @@ builder.defineStreamHandler(async ({ type, id }) => {
         const seeders = torrent.Seeders || torrent.sid || 0;
         const trackerName = (torrent.Tracker || torrent.tracker) ? `[${torrent.Tracker || torrent.tracker}] ` : "";
 
+        let torrentIndex = calculatedIndex;
+        if (type === "series" && season && episode) {
+            const seasonsArray = (torrent.info && torrent.info.seasons) || torrent.seasons;
+            if (Array.isArray(seasonsArray) && seasonsArray.length === 1) {
+                torrentIndex = e;
+            }
+        }
+
         let directStreamUrl = `${TORRSERVER_AUTH_URL}/stream?link=${encodeURIComponent(torrentLink)}&play=true`;
 
         if (type === "series" && season && episode) {
-            directStreamUrl += `&index=${calculatedIndex}`;
+            directStreamUrl += `&index=${torrentIndex}`;
         }
         const binge = "jacred-" + simpleHash(torrentLink);
-        console.log(`📌${id} Stream: ${torrentTitle.substring(0, 50)} | index=${calculatedIndex} | bingeGroup=${binge} | magnet hash=${simpleHash(torrentLink)}`);
+        console.log(`📌${id} Stream: ${torrentTitle.substring(0, 50)} | index=${torrentIndex} | bingeGroup=${binge} | magnet hash=${simpleHash(torrentLink)}`);
         const resLabel = getResolutionLabel(torrent);
         streams.push({
             name: `TorrStream\n${resLabel}`,
