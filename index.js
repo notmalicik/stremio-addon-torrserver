@@ -68,14 +68,13 @@ async function axiosWithRetry(url, retries = 3, baseDelay = 2000) {
     }
 }
 
-async function searchJackettByImdbId(imdbId) {
-    const cacheKey = `imdb_${imdbId.trim()}`;
+async function searchJackettV1(query, cacheKey) {
     const cached = jackettCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
         return cached.data;
     }
 
-    const url = `${JACKETT_URL}/api/v1.0/torrents?search=${encodeURIComponent(imdbId)}&apikey=${JACKETT_API_KEY}`;
+    const url = `${JACKETT_URL}/api/v1.0/torrents?search=${encodeURIComponent(query)}&apikey=${JACKETT_API_KEY}`;
     try {
         const response = await axiosWithRetry(url);
         const results = ensureArray(response.data);
@@ -88,16 +87,16 @@ async function searchJackettByImdbId(imdbId) {
     }
 }
 
-function ensureArray(data) {
-    if (Array.isArray(data)) return data;
-    if (data && Array.isArray(data.Results)) return data.Results;
-    if (data && Array.isArray(data.results)) return data.results;
-    if (data && typeof data === "object") return [data];
-    return [];
+async function searchJackettV1ByName(title) {
+    return searchJackettV1(title, `name_${title.toLowerCase().trim()}`);
 }
 
-async function searchJackettByName(title) {
-    const cacheKey = `name_${title.toLowerCase().trim()}`;
+async function searchJackettV1ByImdbId(imdbId) {
+    return searchJackettV1(imdbId.trim(), `imdb_${imdbId.trim()}`);
+}
+
+async function searchJackettV2ByName(title) {
+    const cacheKey = `name_v2_${title.toLowerCase().trim()}`;
     const cached = jackettCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
         return cached.data;
@@ -111,9 +110,17 @@ async function searchJackettByName(title) {
         return results;
     } catch (err) {
         const status = err.response?.status || "N/A";
-        console.error(`❌ Jackett search error (${status}): ${err.message}`);
+        console.error(`❌ Jackett v2 search error (${status}): ${err.message}`);
         return [];
     }
+}
+
+function ensureArray(data) {
+    if (Array.isArray(data)) return data;
+    if (data && Array.isArray(data.Results)) return data.Results;
+    if (data && Array.isArray(data.results)) return data.results;
+    if (data && typeof data === "object") return [data];
+    return [];
 }
 
 function getResolutionRank(torrent) {
@@ -181,14 +188,21 @@ app.get("/resolve", async (req, res) => {
         res.status(500).send("Error processing torrent");
     }
 });
+function getTorrentSeasons(torrent) {
+    const seasons = (torrent.info && torrent.info.seasons) || torrent.seasons;
+    if (Array.isArray(seasons)) return seasons;
+    if (seasons === null || seasons === undefined || seasons === "") return null;
+    return [seasons];
+}
+
 function matchesSeasonAndEpisode(torrent, season, episode) {
     if (!torrent) return false;
     const title = (torrent.Title || torrent.title || torrent.name || "").toLowerCase();
     const s = parseInt(season);
     const e = parseInt(episode);
 
-    const seasonsArray = (torrent.info && torrent.info.seasons) || torrent.seasons;
-    if (Array.isArray(seasonsArray) && seasonsArray.includes(s)) {
+    const seasonsArray = getTorrentSeasons(torrent);
+    if (seasonsArray && seasonsArray.includes(s)) {
         return true;
     }
 
@@ -223,7 +237,7 @@ function cleanTitle(title) {
 // =====================================================================
 const builder = new addonBuilder({
     id: "org.jacred.torrserver",
-    version: "2.12.0",
+    version: "2.13.1",
     name: "Jac.red + TorrServer",
     description: "Streaming rapid FHD prin TorrServer.",
     catalogs: [],
@@ -245,6 +259,36 @@ function getAbsoluteEpisodeIndex(videos, targetSeason, targetEpisode) {
         }
     }
     return targetEpisode;
+}
+/// Calculate episode index within the torrent's own season range
+function getTorrentEpisodeIndex(videos, torrent, targetSeason, targetEpisode) {
+    const s = parseInt(targetSeason);
+    const e = parseInt(targetEpisode);
+
+    const seasonsArray = getTorrentSeasons(torrent);
+
+    // Single-season torrent: no cumulative increment needed
+    if (seasonsArray && seasonsArray.length === 1) {
+        return e;
+    }
+
+    // Multi-season torrent: count only the episodes of the seasons it contains
+    if (Array.isArray(videos) && Array.isArray(seasonsArray)) {
+        const seasonSet = new Set(seasonsArray.map(Number));
+        let index = 0;
+        for (const v of videos) {
+            const vs = Number(v.season);
+            if (vs === s && Number(v.episode) === e) {
+                return index + 1;
+            }
+            if (seasonSet.has(vs)) {
+                index++;
+            }
+        }
+    }
+
+    // Unknown seasons (e.g. v2 fallback): absolute Cinemeta index
+    return getAbsoluteEpisodeIndex(videos, s, e);
 }
 function simpleHash(str) {
     let hash = 0;
@@ -271,15 +315,21 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 
     const titleQuery = cleanTitle(meta.name);
-    console.log(`🔍 Searching Jackett by name: "${titleQuery}"`);
+    console.log(`🔍 Searching Jackett v1 by name: "${titleQuery}"`);
 
-    let rawResults = await searchJackettByName(titleQuery);
-    console.log(`📦 Jackett v2 returned ${rawResults.length} raw torrents.`);
+    let rawResults = await searchJackettV1ByName(titleQuery);
+    console.log(`📦 Jackett v1 returned ${rawResults.length} raw torrents (by name).`);
 
     if (rawResults.length === 0) {
-        console.log(`🔍 No results by name, trying by IMDb ID: "${imdbId}"`);
-        rawResults = await searchJackettByImdbId(imdbId);
-        console.log(`📦 Jackett v1 returned ${rawResults.length} raw torrents.`);
+        console.log(`🔍 No v1 results by name, trying v1 by IMDb ID: "${imdbId}"`);
+        rawResults = await searchJackettV1ByImdbId(imdbId);
+        console.log(`📦 Jackett v1 returned ${rawResults.length} raw torrents (by ID).`);
+    }
+
+    if (rawResults.length === 0) {
+        console.log(`🔍 No v1 results, falling back to Jackett v2 by name: "${titleQuery}"`);
+        rawResults = await searchJackettV2ByName(titleQuery);
+        console.log(`📦 Jackett v2 returned ${rawResults.length} raw torrents (fallback).`);
     }
 
     let filteredResults = ensureArray(rawResults).filter(torrent => torrent && (torrent.Title || torrent.title));
@@ -301,24 +351,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     console.log(`✅ ${filteredResults.length} sources remaining (sorted: 4K > 1080p > rest).`);
 
-    // Calculate exact index (cumulative for multiple seasons)
-    const calculatedIndex = (type === "series" && season && episode)
-        ? getAbsoluteEpisodeIndex(meta.videos, s, e)
-        : 1;
-
-
     for (const torrent of filteredResults) {
         const torrentLink = torrent.MagnetUri || torrent.magnet || torrent.Link || torrent.Guid;
         const torrentTitle = torrent.Title || torrent.title || torrent.name || "Unknown";
         const seeders = torrent.Seeders || torrent.sid || 0;
         const trackerName = (torrent.Tracker || torrent.tracker) ? `[${torrent.Tracker || torrent.tracker}] ` : "";
 
-        let torrentIndex = calculatedIndex;
+        let torrentIndex = 1;
         if (type === "series" && season && episode) {
-            const seasonsArray = (torrent.info && torrent.info.seasons) || torrent.seasons;
-            if (Array.isArray(seasonsArray) && seasonsArray.length === 1) {
-                torrentIndex = e;
-            }
+            torrentIndex = getTorrentEpisodeIndex(meta.videos, torrent, s, e);
         }
 
         let directStreamUrl = `${TORRSERVER_AUTH_URL}/stream?link=${encodeURIComponent(torrentLink)}&play=true`;
@@ -347,7 +388,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 app.use(getRouter(builder.getInterface()));
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`version: 2.12.0`);
+    console.log(`version: 2.13.1`);
     console.log(`🚀 Add-on running at ${ADDON_URL}`);
     console.log(`👉 Install link: ${ADDON_URL}/manifest.json`);
 });
