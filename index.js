@@ -334,6 +334,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     let filteredResults = ensureArray(rawResults).filter(torrent => torrent && (torrent.Title || torrent.title));
 
+    filteredResults = filteredResults.filter(torrent => {
+        const title = (torrent.Title || torrent.title || torrent.name || "").toLowerCase();
+        const ukrPattern = /(?:українськ|украинск|україн|ukr|ukrainian|dub\s*\(?\s*ua\b|\(uk\b|uk\s*dub|voice\s*over\s*ua\b|ua\s*audio)/i;
+        return !ukrPattern.test(title);
+    });
+
     if (type === "series") {
         filteredResults = filteredResults.filter(torrent => matchesSeasonAndEpisode(torrent, season, episode));
     }
