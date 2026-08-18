@@ -23,6 +23,10 @@ const ADDON_URL = `http://${ADDON_PUBLIC_IP}:${PORT}`;
 
 const JACKETT_URL = process.env.JACKETT_URL || "https://jac.red";
 const JACKETT_API_KEY = process.env.JACKETT_API_KEY || "null";
+const JACKETT_FALLBACK_URLS = (process.env.JACKETT_FALLBACK_URLS || "https://jac-red.ru")
+    .split(",").map(u => u.trim()).filter(Boolean);
+const JACKETT_SERVERS = Array.from(new Set([JACKETT_URL, ...JACKETT_FALLBACK_URLS]));
+const JACKETT_TIMEOUT = parseInt(process.env.JACKETT_TIMEOUT || "5000", 10);
 
 const TORRSERVER_HOST = process.env.TORRSERVER_HOST || "localhost:9090";
 const TORRSERVER_USER = process.env.TORRSERVER_USER || "username";
@@ -48,7 +52,7 @@ async function rateLimitedRequest(url) {
         await new Promise(r => setTimeout(r, wait));
     }
     lastRequestTime = Date.now();
-    return axios.get(url);
+    return axios.get(url, { timeout: JACKETT_TIMEOUT });
 }
 
 async function axiosWithRetry(url, retries = 3, baseDelay = 2000) {
@@ -74,17 +78,22 @@ async function searchJackettV1(query, cacheKey) {
         return cached.data;
     }
 
-    const url = `${JACKETT_URL}/api/v1.0/torrents?search=${encodeURIComponent(query)}&apikey=${JACKETT_API_KEY}`;
-    try {
-        const response = await axiosWithRetry(url);
-        const results = ensureArray(response.data);
-        jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
-        return results;
-    } catch (err) {
-        const status = err.response?.status || "N/A";
-        console.error(`❌ Jackett v1 search error (${status}): ${err.message}`);
-        return [];
+    for (const server of JACKETT_SERVERS) {
+        const url = `${server}/api/v1.0/torrents?search=${encodeURIComponent(query)}&apikey=${JACKETT_API_KEY}`;
+        try {
+            const response = await axiosWithRetry(url);
+            const results = ensureArray(response.data);
+            if (results.length > 0) {
+                jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
+                return results;
+            }
+            console.warn(`⚠️ Jackett v1 on ${server} returned 0 results, trying fallback...`);
+        } catch (err) {
+            const status = err.response?.status || "N/A";
+            console.error(`❌ Jackett v1 search error on ${server} (${status}): ${err.message}`);
+        }
     }
+    return [];
 }
 
 async function searchJackettV1ByName(title) {
@@ -102,17 +111,22 @@ async function searchJackettV2ByName(title) {
         return cached.data;
     }
 
-    const url = `${JACKETT_URL}/api/v2.0/indexers/all/results?apikey=${JACKETT_API_KEY}&query=${encodeURIComponent(title)}`;
-    try {
-        const response = await axiosWithRetry(url);
-        const results = ensureArray(response.data);
-        jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
-        return results;
-    } catch (err) {
-        const status = err.response?.status || "N/A";
-        console.error(`❌ Jackett v2 search error (${status}): ${err.message}`);
-        return [];
+    for (const server of JACKETT_SERVERS) {
+        const url = `${server}/api/v2.0/indexers/all/results?apikey=${JACKETT_API_KEY}&query=${encodeURIComponent(title)}`;
+        try {
+            const response = await axiosWithRetry(url);
+            const results = ensureArray(response.data);
+            if (results.length > 0) {
+                jackettCache.set(cacheKey, { timestamp: Date.now(), data: results });
+                return results;
+            }
+            console.warn(`⚠️ Jackett v2 on ${server} returned 0 results, trying fallback...`);
+        } catch (err) {
+            const status = err.response?.status || "N/A";
+            console.error(`❌ Jackett v2 search error on ${server} (${status}): ${err.message}`);
+        }
     }
+    return [];
 }
 
 function ensureArray(data) {

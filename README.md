@@ -26,6 +26,8 @@ All configuration is done through environment variables. No hardcoded credential
 | `PORT` | `7000` | Port the addon listens on |
 | `ADDON_PUBLIC_IP` | `0.0.0.0` | Public IP/hostname for the install link |
 | `JACKETT_URL` | `https://jac.red` | Jackett server URL |
+| `JACKETT_FALLBACK_URLS` | `https://jac-red.ru` | Fallback Jackett servers (comma-separated), tried if the primary returns nothing within the timeout |
+| `JACKETT_TIMEOUT` | `5000` | Per-request timeout in ms before falling back to the next Jackett server |
 | `JACKETT_API_KEY` | `` | Jackett API key |
 | `TORRSERVER_HOST` | `localhost:9090` | TorrServer host:port |
 | `TORRSERVER_USER` | `` | TorrServer username (optional) |
