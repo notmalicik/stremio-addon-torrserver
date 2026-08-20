@@ -43,7 +43,6 @@ const CACHE_TTL = 15 * 60 * 1000;
 
 const REQUEST_DELAY = 1100;
 let lastRequestTime = 0;
-const requestQueue = [];
 
 async function rateLimitedRequest(url) {
     const now = Date.now();
@@ -104,7 +103,7 @@ async function searchJackettV1ByImdbId(imdbId) {
     return searchJackettV1(imdbId.trim(), `imdb_${imdbId.trim()}`);
 }
 
-// --- NOU: Căutare Jackett v2 cu suport pentru IMDb ID ---
+// --- Jackett v2 ---
 async function searchJackettV2ByImdbId(imdbId) {
     const cacheKey = `imdb_v2_${imdbId.trim()}`;
     const cached = jackettCache.get(cacheKey);
@@ -155,30 +154,62 @@ async function searchJackettV2ByName(title) {
     return [];
 }
 
-// Funcția principală de căutare folosită în handler
-async function searchWithNewOrder(imdbId, title) {
-    // 1. Jackett v2 cu IMDb ID pe serverul principal
-    let results = await searchJackettV2ByImdbId(imdbId);
-    if (results.length > 0) return results;
+// =====================================================================
+// NOUA CĂUTARE COMBINATĂ + DEDUPLICARE
+// =====================================================================
 
-    // 2. Jackett v2 cu IMDb ID pe serverul de rezervă (deja acoperit de bucla din funcție, dar pentru claritate)
-    // (Funcția de mai sus parcurge deja toate serverele; deci pasul 1 și 2 sunt combinate.)
-    // Dacă am ajuns aici, înseamnă că nu s-au găsit rezultate cu IMDb ID pe niciun server.
-    console.log("🔍 Nu s-au găsit rezultate v2 cu IMDb ID, încerc cu numele...");
+function extractInfoHash(link) {
+    const match = link.match(/xt=urn:btih:([a-fA-F0-9]{40})/);
+    return match ? match[1].toLowerCase() : null;
+}
 
-    // 3. Jackett v2 cu nume pe serverul principal
-    results = await searchJackettV2ByName(title);
-    if (results.length > 0) return results;
+function getTorrentKey(torrent) {
+    const link = torrent.MagnetUri || torrent.magnet || torrent.Link || torrent.link || torrent.Guid || torrent.guid;
+    if (link && typeof link === "string") {
+        const infoHash = extractInfoHash(link);
+        if (infoHash) return `infohash:${infoHash}`;
+        return `link:${link.trim().toLowerCase()}`;
+    }
+    // Fallback: titlu + dimensiune
+    const title = torrent.Title || torrent.title || torrent.name || torrent.originalname || "";
+    const size = torrent.Size || torrent.size || torrent.TotalSize || "";
+    return `title:${title.trim().toLowerCase()}|${size}`;
+}
 
-    // 4. Jackett v2 cu nume pe serverul de rezervă (deja inclus)
-    console.log("🔍 Nu s-au găsit rezultate v2 cu nume, trec la v1 ca ultimă soluție...");
+function deduplicateTorrents(torrents) {
+    const seen = new Map();
+    const unique = [];
+    for (const torrent of torrents) {
+        const key = getTorrentKey(torrent);
+        if (!seen.has(key)) {
+            seen.set(key, true);
+            unique.push(torrent);
+        }
+    }
+    return unique;
+}
 
-    // 5. Fallback la Jackett v1 (opțional, păstrat pentru compatibilitate)
-    results = await searchJackettV1ByImdbId(imdbId);
-    if (results.length > 0) return results;
+async function searchCombined(imdbId, title) {
+    console.log(`🔍 Căutare combinată: IMDb "${imdbId}" + nume "${title}"`);
 
-    results = await searchJackettV1ByName(title);
-    return results;
+    // Căutăm în v2 după IMDb ID și nume (secvențial pentru a respecta rate limit)
+    const resultsByImdb = await searchJackettV2ByImdbId(imdbId);
+    const resultsByName = await searchJackettV2ByName(title);
+
+    let combined = [...resultsByImdb, ...resultsByName];
+
+    // Dacă nu am găsit nimic în v2, încercăm v1 ca fallback
+    if (combined.length === 0) {
+        console.log("⚠️ Nimic în v2, încerc v1...");
+        const v1ByImdb = await searchJackettV1ByImdbId(imdbId);
+        const v1ByName = await searchJackettV1ByName(title);
+        combined = [...v1ByImdb, ...v1ByName];
+    }
+
+    // Deduplicare
+    const unique = deduplicateTorrents(combined);
+    console.log(`📦 Rezultate brute: ${combined.length}, după deduplicare: ${unique.length}`);
+    return unique;
 }
 
 function ensureArray(data) {
@@ -191,10 +222,7 @@ function ensureArray(data) {
 
 function getResolutionRank(torrent) {
     if (!torrent) return 0;
-    // v2: info.quality este numeric (ex: 2160, 1080)
     const qualityVal = (torrent.info && torrent.info.quality) || torrent.quality;
-
-    // v1: titlul conține rezoluția
     const title = (torrent.Title || torrent.title || torrent.name || torrent.originalname || "").toLowerCase();
 
     if (qualityVal) {
@@ -261,7 +289,6 @@ app.get("/resolve", async (req, res) => {
 });
 
 function getTorrentSeasons(torrent) {
-    // v2: info.seasons este array de numere
     const seasons = (torrent.info && torrent.info.seasons) || torrent.seasons;
     if (Array.isArray(seasons)) return seasons;
     if (seasons === null || seasons === undefined || seasons === "") return null;
@@ -274,22 +301,18 @@ function matchesSeasonAndEpisode(torrent, season, episode) {
     const s = parseInt(season);
     const e = parseInt(episode);
 
-    // Verificăm în info.seasons (v2)
     const seasonsArray = getTorrentSeasons(torrent);
     if (seasonsArray && seasonsArray.includes(s)) {
         return true;
     }
 
-    // Pattern-uri comune în titlu
     const standardMatch = new RegExp(`s0*${s}\\s*[e\\.]\\s*0*${e}\\b`, 'i').test(title);
     const crossMatch = new RegExp(`\\b0*${s}x0*${e}\\b`, 'i').test(title);
     if (standardMatch || crossMatch) return true;
 
-    // Pattern rusesc
     const ruMatch = new RegExp(`(?:сезон|season)[\\s_]*0*${s}.*?(?:серия|эпизод|ep|с)[\\s_]*0*${e}\\b`, 'i').test(title);
     if (ruMatch) return true;
 
-    // Sezon pack rusesc
     const seasonPackRu = new RegExp(`(?:сезон|season|s)\\s*0*${s}\\b`, 'i').test(title);
     if (seasonPackRu) return true;
 
@@ -314,7 +337,7 @@ function cleanTitle(title) {
 // =====================================================================
 const builder = new addonBuilder({
     id: "org.jacred.torrserver",
-    version: "2.13.1",
+    version: "2.14.0",
     name: "Jac.red + TorrServer",
     description: "Streaming rapid FHD prin TorrServer.",
     catalogs: [],
@@ -346,12 +369,10 @@ function getTorrentEpisodeIndex(videos, torrent, targetSeason, targetEpisode) {
 
     const seasonsArray = getTorrentSeasons(torrent);
 
-    // Single-season torrent: no cumulative increment needed
     if (seasonsArray && seasonsArray.length === 1) {
         return e;
     }
 
-    // Multi-season torrent: count only the episodes of the seasons it contains
     if (Array.isArray(videos) && Array.isArray(seasonsArray)) {
         const seasonSet = new Set(seasonsArray.map(Number));
         let index = 0;
@@ -366,7 +387,6 @@ function getTorrentEpisodeIndex(videos, torrent, targetSeason, targetEpisode) {
         }
     }
 
-    // Unknown seasons (e.g. v2 fallback): absolute Cinemeta index
     return getAbsoluteEpisodeIndex(videos, s, e);
 }
 
@@ -374,7 +394,7 @@ function simpleHash(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
         hash = (hash << 5) - hash + str.charCodeAt(i);
-        hash |= 0; // 32-bit integer
+        hash |= 0;
     }
     return Math.abs(hash).toString(36);
 }
@@ -395,15 +415,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 
     const titleQuery = cleanTitle(meta.name);
-    console.log(`🔍 Căutare Jackett v2 cu IMDb ID: "${imdbId}"`);
+    console.log(`🔍 Căutare combinată pentru IMDb: "${imdbId}" și titlu: "${titleQuery}"`);
 
-    // Noua secvență de căutare
-    let rawResults = await searchWithNewOrder(imdbId, titleQuery);
-    console.log(`📦 Raw results (după noua ordine): ${rawResults.length}`);
+    // Folosim noua funcție de căutare combinată
+    let rawResults = await searchCombined(imdbId, titleQuery);
+    console.log(`📦 Rezultate primite (după deduplicare): ${rawResults.length}`);
 
     let filteredResults = ensureArray(rawResults).filter(torrent => torrent && (torrent.Title || torrent.title || torrent.name || torrent.originalname));
 
-    // Eliminăm rezultatele cu audio ucrainean (dacă există)
+    // Eliminăm rezultatele cu audio ucrainean
     filteredResults = filteredResults.filter(torrent => {
         const title = (torrent.Title || torrent.title || torrent.name || torrent.originalname || "").toLowerCase();
         const ukrPattern = /(?:українськ|украинск|україн|ukr|ukrainian|dub\s*\(?\s*ua\b|\(uk\b|uk\s*dub|voice\s*over\s*ua\b|ua\s*audio)/i;
@@ -469,7 +489,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 app.use(getRouter(builder.getInterface()));
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`version: 2.13.1`);
+    console.log(`version: 2.14.0`);
     console.log(`🚀 Add-on running at ${ADDON_URL}`);
     console.log(`👉 Install link: ${ADDON_URL}/manifest.json`);
 });
